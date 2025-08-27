@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import aiohttp
+from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -37,8 +38,6 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
 )
-from dotenv import load_dotenv
-
 
 load_dotenv()
 
@@ -51,6 +50,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 # ------- Logging -------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 # ------- Persistence helpers -------
 def load_subscriptions() -> Dict[str, List[int]]:
@@ -79,6 +79,7 @@ def save_subscriptions(subs: Dict[str, List[int]]) -> None:
 subscriptions: Dict[str, List[int]] = load_subscriptions()
 prev_states: Dict[str, bool] = {}  # gpu_name -> busy
 gpu_display_names: Dict[str, str] = {}  # gpu_name -> display_name
+
 
 # ------- API fetch -------
 async def fetch_gpus(session: aiohttp.ClientSession) -> Optional[list]:
@@ -136,12 +137,15 @@ async def subscribe_command(update: Update, context: CallbackContext):
         busy = g.get("busy")
         emoji = "🔴" if busy else "🟢"
         gpu_display_names[name] = disp
-        keyboard.append([
-            InlineKeyboardButton(f"{disp} {emoji}", callback_data=f"sub|{name}")
-        ])
+        keyboard.append(
+            [InlineKeyboardButton(f"{disp} {emoji}", callback_data=f"sub|{name}")]
+        )
     keyboard.append([InlineKeyboardButton("Cancel", callback_data="cancel")])
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Select a GPU to be notified when it becomes AVAILABLE:", reply_markup=reply_markup)
+    await update.message.reply_text(
+        "Select a GPU to be notified when it becomes AVAILABLE:",
+        reply_markup=reply_markup,
+    )
 
 
 async def my_subs_command(update: Update, context: CallbackContext):
@@ -161,17 +165,26 @@ async def unsubscribe_command(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
     my = [gpu for gpu, chats in subscriptions.items() if chat_id in chats]
     if not my:
-        await update.message.reply_text("You have no subscriptions to unsubscribe from.")
+        await update.message.reply_text(
+            "You have no subscriptions to unsubscribe from."
+        )
         return
-    keyboard = [[InlineKeyboardButton(gpu_display_names.get(g, g), callback_data=f"unsub|{g}")] for g in my]
+    keyboard = [
+        [InlineKeyboardButton(gpu_display_names.get(g, g), callback_data=f"unsub|{g}")]
+        for g in my
+    ]
     keyboard.append([InlineKeyboardButton("Cancel", callback_data="cancel")])
-    await update.message.reply_text("Select a subscription to remove:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text(
+        "Select a subscription to remove:", reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 
 async def status_command(update: Update, context: CallbackContext):
     # show last known states (from prev_states)
     if not prev_states:
-        await update.message.reply_text("No status known yet. Wait a moment for the bot to poll the API.")
+        await update.message.reply_text(
+            "No status known yet. Wait a moment for the bot to poll the API."
+        )
         return
     lines = ["Last known GPU status:"]
     for name, busy in prev_states.items():
@@ -204,7 +217,9 @@ async def callback_handler(update: Update, context: CallbackContext):
             subs.append(chat_id)
             subscriptions[gpu_name] = subs
             save_subscriptions(subscriptions)
-            await query.edit_message_text(f"You will be notified when {gpu_display_names.get(gpu_name, gpu_name)} becomes AVAILABLE.")
+            await query.edit_message_text(
+                f"You will be notified when {gpu_display_names.get(gpu_name, gpu_name)} becomes AVAILABLE."
+            )
         else:
             await query.edit_message_text("You are already subscribed to this GPU.")
     elif action == "unsub":
@@ -216,7 +231,9 @@ async def callback_handler(update: Update, context: CallbackContext):
             else:
                 subscriptions.pop(gpu_name, None)
             save_subscriptions(subscriptions)
-            await query.edit_message_text(f"Unsubscribed from {gpu_display_names.get(gpu_name, gpu_name)}.")
+            await query.edit_message_text(
+                f"Unsubscribed from {gpu_display_names.get(gpu_name, gpu_name)}."
+            )
         else:
             await query.edit_message_text("You were not subscribed to that GPU.")
     else:
@@ -253,12 +270,18 @@ async def poller_task(app: "telegram.ext.Application"):
                         # notify subscribers for this GPU
                         targets = subscriptions.get(name, [])
                         if targets:
-                            message = f"\U0001F6A8 {gpu_display_names.get(name, name)} is now AVAILABLE!\nGPU id: {name}"
+                            message = f"\U0001f6a8 {gpu_display_names.get(name, name)} is now AVAILABLE!\nGPU id: {name}"
                             for chat_id in targets.copy():
                                 try:
-                                    await app.bot.send_message(chat_id=chat_id, text=message)
+                                    await app.bot.send_message(
+                                        chat_id=chat_id, text=message
+                                    )
                                 except Exception as e:
-                                    logger.warning("Failed to send notification to %s: %s", chat_id, e)
+                                    logger.warning(
+                                        "Failed to send notification to %s: %s",
+                                        chat_id,
+                                        e,
+                                    )
                     # store state
                 prev_states = current_states
 
@@ -295,8 +318,35 @@ async def main():
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
+    import asyncio
+    import sys
 
+    # On Windows, prefer the selector event loop policy for compatibility
+    if sys.platform.startswith("win"):
+        try:
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        except Exception:
+            pass
+
+    try:
+        # Normal run (works when no loop is already running)
+        asyncio.run(main())
+    except RuntimeError:
+        # Fallback for environments that already have a running loop (e.g. Jupyter)
+        # Install nest_asyncio if you haven't: pip install nest_asyncio
+        try:
+            import nest_asyncio
+
+            nest_asyncio.apply()
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Run the main coroutine in the existing loop
+                # create_task returns immediately, so ensure we keep the loop alive by awaiting main()
+                loop.run_until_complete(main())
+            else:
+                loop.run_until_complete(main())
+        except Exception as exc:
+            import logging
+
+            logging.exception("Failed fallback run: %s", exc)
+            raise
