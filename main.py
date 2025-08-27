@@ -291,7 +291,7 @@ async def poller_task(app: "telegram.ext.Application"):
 
 
 # ------- Main setup -------
-async def main():
+def main():
     if not TELEGRAM_TOKEN:
         logger.error("TELEGRAM_TOKEN environment variable not set. Exiting.")
         return
@@ -310,43 +310,11 @@ async def main():
     app.add_handler(CallbackQueryHandler(callback_handler))
 
     # start background poller as a task
-    # create_task is the recommended way to run background async tasks
     app.create_task(poller_task(app))
 
-    # run the bot (this will block)
-    await app.run_polling()
+    # IMPORTANT: just call run_polling() directly
+    app.run_polling()
 
 
 if __name__ == "__main__":
-    import asyncio
-    import sys
-
-    # On Windows, prefer the selector event loop policy for compatibility
-    if sys.platform.startswith("win"):
-        try:
-            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-        except Exception:
-            pass
-
-    try:
-        # Normal run (works when no loop is already running)
-        asyncio.run(main())
-    except RuntimeError:
-        # Fallback for environments that already have a running loop (e.g. Jupyter)
-        # Install nest_asyncio if you haven't: pip install nest_asyncio
-        try:
-            import nest_asyncio
-
-            nest_asyncio.apply()
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # Run the main coroutine in the existing loop
-                # create_task returns immediately, so ensure we keep the loop alive by awaiting main()
-                loop.run_until_complete(main())
-            else:
-                loop.run_until_complete(main())
-        except Exception as exc:
-            import logging
-
-            logging.exception("Failed fallback run: %s", exc)
-            raise
+    main()
