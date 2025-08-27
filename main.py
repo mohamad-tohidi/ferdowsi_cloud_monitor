@@ -37,6 +37,10 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
 )
+from dotenv import load_dotenv
+
+
+load_dotenv()
 
 # ------- Configuration -------
 API_URL = "https://api.ferdowsi.cloud/api/v2/sm/mhd-fum1/flavors/gpus"
