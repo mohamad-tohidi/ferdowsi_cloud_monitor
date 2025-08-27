@@ -7,19 +7,6 @@ Requirements:
 - Python 3.10+
 - python-telegram-bot (v20+)
 - aiohttp
-
-Install:
-    pip install python-telegram-bot==20.6 aiohttp
-
-Set environment variable TELEGRAM_TOKEN with your bot token before running.
-
-Run:
-    python telegram_gpu_monitor_bot.py
-
-Notes:
-- Subscriptions are persisted in subscriptions.json (simple JSON file).
-- The bot polls the API once globally every 1 second to keep load low.
-
 """
 
 import asyncio
@@ -34,7 +21,6 @@ from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
-    CallbackContext,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -82,6 +68,21 @@ prev_states: Dict[str, bool] = {}  # gpu_name -> busy
 gpu_display_names: Dict[str, str] = {}  # gpu_name -> display_name
 
 
+# ------- Helper to manage two sessions (proxy vs no-proxy) -------
+def get_session_for_app(app, use_proxy: bool) -> aiohttp.ClientSession:
+    """
+    Lazily create and return a session stored in app.bot_data.
+    - use_proxy True -> session with trust_env=True (respects HTTP_PROXY)
+    - use_proxy False -> session with trust_env=False (ignores env proxy)
+    """
+    key = "http_session_proxy" if use_proxy else "http_session_noproxy"
+    session = app.bot_data.get(key)
+    if session is None:
+        session = aiohttp.ClientSession(trust_env=True if use_proxy else False)
+        app.bot_data[key] = session
+    return session
+
+
 # ------- API fetch -------
 async def fetch_gpus(session: aiohttp.ClientSession) -> Optional[list]:
     try:
@@ -95,7 +96,7 @@ async def fetch_gpus(session: aiohttp.ClientSession) -> Optional[list]:
 
 
 # ------- Telegram command handlers -------
-async def start(update: Update, context: CallbackContext):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hi! I will monitor GPUs and notify you when a selected GPU becomes available.\n"
         "Use /subscribe to choose GPUs to be notified about.\n"
@@ -103,10 +104,11 @@ async def start(update: Update, context: CallbackContext):
     )
 
 
-async def list_gpus_command(update: Update, context: CallbackContext):
-    # show current GPUs and status with quick fetch
-    async with aiohttp.ClientSession() as session:
-        gpus = await fetch_gpus(session)
+async def list_gpus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # use the NO-PROXY session for Ferdowsi API
+    app = context.application
+    session = get_session_for_app(app, use_proxy=False)
+    gpus = await fetch_gpus(session)
     if not gpus:
         await update.message.reply_text("Failed to fetch GPU list. Try again later.")
         return
@@ -121,11 +123,12 @@ async def list_gpus_command(update: Update, context: CallbackContext):
     await update.message.reply_text("\n".join(text_lines))
 
 
-async def subscribe_command(update: Update, context: CallbackContext):
+async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send an inline keyboard letting user pick GPUs to subscribe to."""
     chat_id = update.effective_chat.id
-    async with aiohttp.ClientSession() as session:
-        gpus = await fetch_gpus(session)
+    app = context.application
+    session = get_session_for_app(app, use_proxy=False)  # NO-PROXY for Ferdowsi API
+    gpus = await fetch_gpus(session)
     if not gpus:
         await update.message.reply_text("Failed to fetch GPU list. Try again later.")
         return
@@ -149,7 +152,7 @@ async def subscribe_command(update: Update, context: CallbackContext):
     )
 
 
-async def my_subs_command(update: Update, context: CallbackContext):
+async def my_subs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     my = [gpu for gpu, chats in subscriptions.items() if chat_id in chats]
     if not my:
@@ -161,7 +164,7 @@ async def my_subs_command(update: Update, context: CallbackContext):
     await update.message.reply_text("\n".join(lines))
 
 
-async def unsubscribe_command(update: Update, context: CallbackContext):
+async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # show inline keyboard of user's subscriptions
     chat_id = update.effective_chat.id
     my = [gpu for gpu, chats in subscriptions.items() if chat_id in chats]
@@ -180,7 +183,7 @@ async def unsubscribe_command(update: Update, context: CallbackContext):
     )
 
 
-async def status_command(update: Update, context: CallbackContext):
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # show last known states (from prev_states)
     if not prev_states:
         await update.message.reply_text(
@@ -195,7 +198,7 @@ async def status_command(update: Update, context: CallbackContext):
 
 
 # ------- Callback query handler for inline buttons -------
-async def callback_handler(update: Update, context: CallbackContext):
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -241,71 +244,14 @@ async def callback_handler(update: Update, context: CallbackContext):
         await query.edit_message_text("Unknown action.")
 
 
-# ------- Background poller task -------
-async def poller_task(app: "telegram.ext.Application"):
-    """Global polling loop that fetches GPU states every POLL_INTERVAL_SECONDS and notifies subscribers when a GPU becomes AVAILABLE."""
-    global prev_states
-    logger.info("Starting poller loop (interval=%ss)", POLL_INTERVAL_SECONDS)
-    async with aiohttp.ClientSession() as session:
-        while True:
-            try:
-                gpus = await fetch_gpus(session)
-                if gpus is None:
-                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
-                    continue
-
-                # update display names map and build current states
-                current_states: Dict[str, bool] = {}
-                for g in gpus:
-                    name = g.get("name")
-                    disp = g.get("display_name") or name
-                    busy = bool(g.get("busy"))
-                    gpu_display_names[name] = disp
-                    current_states[name] = busy
-
-                # detect transitions: busy -> not busy
-                for name, busy in current_states.items():
-                    prev_busy = prev_states.get(name)
-                    # if known previously and it changed from busy True to now False -> notify
-                    if prev_busy is True and busy is False:
-                        # notify subscribers for this GPU
-                        targets = subscriptions.get(name, [])
-                        if targets:
-                            message = f"\U0001f6a8 {gpu_display_names.get(name, name)} is now AVAILABLE!\nGPU id: {name}"
-                            for chat_id in targets.copy():
-                                try:
-                                    await app.bot.send_message(
-                                        chat_id=chat_id, text=message
-                                    )
-                                except Exception as e:
-                                    logger.warning(
-                                        "Failed to send notification to %s: %s",
-                                        chat_id,
-                                        e,
-                                    )
-                    # store state
-                prev_states = current_states
-
-            except Exception as e:
-                logger.exception("Poller error: %s", e)
-            await asyncio.sleep(POLL_INTERVAL_SECONDS)
-
-
-# --- imports near top of file ---
-
-
-# --- replace poller_task with poller_job ---
+# --- Poller job (runs inside JobQueue) ---
 async def poller_job(context: ContextTypes.DEFAULT_TYPE):
     """JobQueue callback: polls API and notifies subscribers on busy->not-busy transition."""
     global prev_states
 
-    # create and reuse aiohttp session stored in application.bot_data
     app = context.application
-    session = app.bot_data.get("http_session")
-    if session is None:
-        # creating ClientSession synchronously is OK
-        session = aiohttp.ClientSession()
-        app.bot_data["http_session"] = session
+    # NO-PROXY session to call Ferdowsi API
+    session = get_session_for_app(app, use_proxy=False)
 
     try:
         gpus = await fetch_gpus(session)
@@ -341,7 +287,7 @@ async def poller_job(context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Poller job error")
 
 
-# --- replace main() with a synchronous main that registers the job ---
+# --- main() that registers handlers and job queue ---
 def main():
     if not TELEGRAM_TOKEN:
         logger.error("TELEGRAM_TOKEN environment variable not set. Exiting.")
@@ -364,17 +310,16 @@ def main():
     try:
         app.run_polling()
     finally:
-        # cleanup: try to close aiohttp session if it was created
-        session = app.bot_data.get("http_session")
-        if session is not None:
-            # after run_polling() returns there should be no running loop
-            import asyncio as _asyncio
-
-            try:
-                _asyncio.run(session.close())
-            except Exception:
-                # if for some reason the loop handling is different, ignore
-                pass
+        # cleanup: try to close both aiohttp sessions if they were created
+        sess_keys = ["http_session_proxy", "http_session_noproxy"]
+        for key in sess_keys:
+            session = app.bot_data.get(key)
+            if session is not None:
+                try:
+                    # after run_polling() returns there should be no running loop, so safe to run a new one to close
+                    asyncio.run(session.close())
+                except Exception as e:
+                    logger.warning("Failed to close session %s: %s", key, e)
 
 
 if __name__ == "__main__":
