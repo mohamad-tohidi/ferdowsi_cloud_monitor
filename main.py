@@ -37,6 +37,7 @@ from telegram.ext import (
     CallbackContext,
     CallbackQueryHandler,
     CommandHandler,
+    ContextTypes,
 )
 
 load_dotenv()
@@ -290,7 +291,57 @@ async def poller_task(app: "telegram.ext.Application"):
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
 
-# ------- Main setup -------
+# --- imports near top of file ---
+
+
+# --- replace poller_task with poller_job ---
+async def poller_job(context: ContextTypes.DEFAULT_TYPE):
+    """JobQueue callback: polls API and notifies subscribers on busy->not-busy transition."""
+    global prev_states
+
+    # create and reuse aiohttp session stored in application.bot_data
+    app = context.application
+    session = app.bot_data.get("http_session")
+    if session is None:
+        # creating ClientSession synchronously is OK
+        session = aiohttp.ClientSession()
+        app.bot_data["http_session"] = session
+
+    try:
+        gpus = await fetch_gpus(session)
+        if gpus is None:
+            return
+
+        current_states: Dict[str, bool] = {}
+        for g in gpus:
+            name = g.get("name")
+            disp = g.get("display_name") or name
+            busy = bool(g.get("busy"))
+            gpu_display_names[name] = disp
+            current_states[name] = busy
+
+        # detect transitions busy -> not busy
+        for name, busy in current_states.items():
+            prev_busy = prev_states.get(name)
+            if prev_busy is True and busy is False:
+                targets = subscriptions.get(name, [])
+                if targets:
+                    message = f"\U0001f6a8 {gpu_display_names.get(name, name)} is now AVAILABLE!\nGPU id: {name}"
+                    for chat_id in targets.copy():
+                        try:
+                            await app.bot.send_message(chat_id=chat_id, text=message)
+                        except Exception as e:
+                            logger.warning(
+                                "Failed to send notification to %s: %s", chat_id, e
+                            )
+
+        prev_states = current_states
+
+    except Exception:
+        logger.exception("Poller job error")
+
+
+# --- replace main() with a synchronous main that registers the job ---
 def main():
     if not TELEGRAM_TOKEN:
         logger.error("TELEGRAM_TOKEN environment variable not set. Exiting.")
@@ -305,15 +356,25 @@ def main():
     app.add_handler(CommandHandler("my_subs", my_subs_command))
     app.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
     app.add_handler(CommandHandler("status", status_command))
-
-    # callback for inline buttons
     app.add_handler(CallbackQueryHandler(callback_handler))
 
-    # start background poller as a task
-    app.create_task(poller_task(app))
+    # schedule the poller via JobQueue (runs in the application's event loop)
+    app.job_queue.run_repeating(poller_job, interval=POLL_INTERVAL_SECONDS, first=0)
 
-    # IMPORTANT: just call run_polling() directly
-    app.run_polling()
+    try:
+        app.run_polling()
+    finally:
+        # cleanup: try to close aiohttp session if it was created
+        session = app.bot_data.get("http_session")
+        if session is not None:
+            # after run_polling() returns there should be no running loop
+            import asyncio as _asyncio
+
+            try:
+                _asyncio.run(session.close())
+            except Exception:
+                # if for some reason the loop handling is different, ignore
+                pass
 
 
 if __name__ == "__main__":
