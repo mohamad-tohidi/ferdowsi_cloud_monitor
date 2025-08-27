@@ -1,5 +1,5 @@
 python-telegram-bot==20.6
 aiohttp==3.8.4
-python-dotenv==1.0.0      # optional — load TELEGRAM_TOKEN from a .env file
-uvloop==0.17.0            # optional — faster event loop on Unix
-
+python-dotenv==1.0.0      
+uvloop==0.17.0            
+nest_asyncio
